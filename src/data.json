@@ -1,0 +1,21 @@
+{
+  "_": "Dữ liệu mẫu cho nút \"Nạp dữ liệu mẫu\" ở trang Tổng quan. Sửa file này là đổi được dữ liệu mẫu, không phải đụng vào App.jsx. Id và ngày tháng do seed() sinh lúc chạy; ở đây chỉ dùng khoá \"ref\" để các mục tham chiếu lẫn nhau.",
+  "members": [
+    { "ref": "nam",  "name": "Nam",   "phone": "", "level": "Trung bình", "active": true, "deposit": 300000 },
+    { "ref": "hung", "name": "Hưng",  "phone": "", "level": "Khá",        "active": true, "deposit": 300000 },
+    { "ref": "linh", "name": "Linh",  "phone": "", "level": "Tốt",        "active": true, "deposit": 300000 },
+    { "ref": "quan", "name": "Quân",  "phone": "", "level": "Trung bình", "active": true, "deposit": 300000 },
+    { "ref": "thao", "name": "Thảo",  "phone": "", "level": "Khá",        "active": true, "deposit": 300000 },
+    { "ref": "dat",  "name": "Đạt",   "phone": "", "level": "Tốt",        "active": true, "deposit": 300000 },
+    { "ref": "mai",  "name": "Mai",   "phone": "", "level": "Trung bình", "active": true, "deposit": 300000 },
+    { "ref": "tuan", "name": "Tuấn",  "phone": "", "level": "Khá",        "active": true, "deposit": 300000 }
+  ],
+  "courts": [
+    { "ref": "cau-giay", "name": "Sân Cầu Giấy – sân 3",        "place": "12 Trần Duy Hưng", "price": 90000,  "note": "" },
+    { "ref": "my-dinh",  "name": "Nhà thi đấu Mỹ Đình – sân 1", "place": "Lê Đức Thọ",       "price": 120000, "note": "" }
+  ],
+  "slots": [
+    { "dow": 3, "start": "19:00", "end": "21:00", "court": "cau-giay" },
+    { "dow": 0, "start": "08:00", "end": "10:00", "court": "my-dinh" }
+  ]
+}

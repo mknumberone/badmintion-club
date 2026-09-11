@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import SEED from "./data.json";
 
 /* Lưu dữ liệu bằng localStorage của trình duyệt.
    Bản chạy trong Claude dùng window.storage; ngoài Claude thì không có API đó,
@@ -246,7 +247,7 @@ const hoursBetween = (a, b) => {
 };
 const roundUp = (n, step = 1000) => Math.ceil(n / step) * step;
 
-const THU_CATS = ["Nạp quỹ", "Tài trợ", "Khác"];
+const THU_CATS = ["Nạp quỹ", "Tài trợ", "Khách đánh ghép", "Khác"];
 const CHI_CATS = ["Tiền sân", "Tiền cầu", "Nước uống", "Giải thưởng", "Khác"];
 
 /* thu = tiền vào quỹ · chi = tiền ra khỏi quỹ · tru = trừ số dư của thành viên (tiền đã nằm trong quỹ) */
@@ -255,8 +256,19 @@ const cashOf = (txs) =>
 const memBal = (txs, id) =>
   txs.filter((t) => t.memberId === id)
     .reduce((s, t) => (t.type === "thu" ? s + t.amount : t.type === "tru" ? s - t.amount : s), 0);
+/* Tiền CLB đang giữ hộ (số dư dương) và tiền thành viên đang nợ (số dư âm) phải
+   tách nhau: khoản nợ là tiền chưa đòi được, không phải tiền quỹ tiêu được. */
+const depositsOf = (txs, members) =>
+  members.reduce((s, m) => s + Math.max(0, memBal(txs, m.id)), 0);
+const debtsOf = (txs, members) =>
+  members.reduce((s, m) => s + Math.max(0, -memBal(txs, m.id)), 0);
 
 const EMPTY = { members: [], courts: [], sessions: [], txs: [], slots: [] };
+
+/* Mỗi người có một hệ số phần, mặc định 1. Đánh nửa buổi thì 0.5, dẫn thêm một
+   người đánh ghép thì 2. Tiền chia theo tổng phần chứ không theo đầu người. */
+const SHARES = [[0.5, "½ · nửa buổi"], [1, "1 · cả buổi"], [1.5, "1½"], [2, "2 · kèm khách"]];
+const shareOf = (s, id) => s.shares?.[id] ?? 1;
 
 function sessionCost(s, courts) {
   const court = courts.find((c) => c.id === s.courtId);
@@ -265,9 +277,22 @@ function sessionCost(s, courts) {
   const shuttleCost = (s.shuttles || 0) * (s.shuttlePrice || 0);
   const extra = s.extra || 0;
   const total = courtCost + shuttleCost + extra;
-  const n = (s.attendees || []).length;
-  const perHead = n ? roundUp(total / n) : 0;
-  return { court, hrs, courtCost, shuttleCost, extra, total, n, perHead, collected: perHead * n };
+  /* Khách vãng lai cũng là một phần trong mẫu số, khác ở chỗ họ trả tiền mặt
+     ngay chứ không có số dư trong quỹ để trừ. */
+  const parts = [
+    ...(s.attendees || []).map((id) => ({ key: id, memberId: id, name: null, share: shareOf(s, id) })),
+    ...(s.guests || []).map((g) => ({ key: "g:" + g.id, memberId: null, name: g.name || "Khách", share: g.share ?? 1 })),
+  ].filter((p) => p.share > 0);
+  const units = parts.reduce((a, p) => a + p.share, 0);
+  const perUnit = units ? total / units : 0;
+  for (const p of parts) p.amount = roundUp(perUnit * p.share);
+  const collected = parts.reduce((a, p) => a + p.amount, 0);
+  return {
+    court, hrs, courtCost, shuttleCost, extra, total,
+    n: parts.length, units, perUnit, parts, collected,
+    perHead: units ? roundUp(perUnit) : 0,
+    guestCash: parts.filter((p) => !p.memberId).reduce((a, p) => a + p.amount, 0),
+  };
 }
 
 /* ─────────────────────────  ICONS  ───────────────────────── */
@@ -316,8 +341,13 @@ const Stat = ({ label, value, tone }) => (
   <div className={"stat " + (tone || "")}><span>{label}</span><b>{value}</b></div>
 );
 
-const Adm = React.createContext(true);
-const useAdmin = () => React.useContext(Adm);
+/* Ba vai: thủ quỹ làm được tất cả, trực buổi lo lịch và chốt tiền buổi, còn lại
+   chỉ xem. Mỗi vai một mã dùng chung, khoá nhẹ chống sửa nhầm khi chuyền máy. */
+const ROLES = { admin: "Thủ quỹ", host: "Trực buổi", view: "Chỉ xem" };
+const Role = React.createContext("admin");
+const useRole = () => React.useContext(Role);
+const useAdmin = () => useRole() === "admin";   // tiền, thành viên, sân, mã
+const useHost = () => useRole() !== "view";     // lịch và chốt tiền buổi
 
 function CourtThumb() {
   const L = { stroke: "#F7F9F5", strokeOpacity: 0.45, strokeWidth: 1, fill: "none" };
@@ -349,7 +379,7 @@ export default function App() {
   const [data, setData] = useState(EMPTY);
   const [ready, setReady] = useState(false);
   const [saveErr, setSaveErr] = useState(false);
-  const [admin, setAdmin] = useState(true);
+  const [role, setRole] = useState("admin");
   const [gate, setGate] = useState(null);
   const first = useRef(true);
 
@@ -362,8 +392,22 @@ export default function App() {
           // dữ liệu cũ: tiền buổi đánh từng ghi là "thu" → giờ là khoản trừ số dư
           d.txs = d.txs.map((t) =>
             t.type === "thu" && t.sesId && t.memberId ? { ...t, type: "tru" } : t);
+          // dữ liệu cũ: cả buổi dồn vào một khoản "Tiền sân" → tách tiền cầu và chi khác ra
+          d.txs = d.txs.flatMap((t) => {
+            if (t.type !== "chi" || !t.sesId || t.cat !== "Tiền sân") return [t];
+            const ses = d.sessions.find((x) => x.id === t.sesId);
+            if (!ses) return [t];
+            const c = sessionCost(ses, d.courts);
+            // buổi bị sửa sau khi chốt thì số không khớp nữa, để nguyên cho an toàn
+            if (c.total !== t.amount || c.courtCost === t.amount) return [t];
+            return [["Tiền sân", c.courtCost], ["Tiền cầu", c.shuttleCost], ["Khác", c.extra]]
+              .filter(([, amount]) => amount > 0)
+              .map(([cat, amount], i) => ({ ...t, id: i ? uid() : t.id, cat, amount }));
+          });
           setData(d);
-          if (d.pin) setAdmin(false);
+          // dữ liệu cũ: một mã duy nhất → thành mã thủ quỹ
+          if (d.pin) { d.pins = { admin: d.pin, ...(d.pins || {}) }; delete d.pin; }
+          if (d.pins?.admin) setRole("view");
         }
       } catch (e) { /* chưa có dữ liệu */ }
       setReady(true);
@@ -386,30 +430,38 @@ export default function App() {
   const { members, courts, sessions, txs, slots } = data;
 
   const balance = useMemo(() => cashOf(txs), [txs]);
-  const held = useMemo(
-    () => members.reduce((s, m) => s + memBal(txs, m.id), 0), [members, txs]);
+  const pins = data.pins || {};
+  const locked = !!pins.admin;
+  const deposits = useMemo(() => depositsOf(txs, members), [members, txs]);
+  const debts = useMemo(() => debtsOf(txs, members), [members, txs]);
   const sorted = useMemo(
     () => [...sessions].sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)), [sessions]);
   const upcoming = useMemo(() => sorted.filter((s) => s.date >= today()), [sorted]);
   const unsettled = useMemo(
     () => sorted.filter((s) => !s.settled && s.date < today()).length, [sorted]);
 
+  /* Dữ liệu mẫu đọc từ src/data.json. Trong file đó các mục nối với nhau bằng
+     khoá "ref"; ở đây đổi sang id thật và gắn ngày hôm nay. */
   const seed = () => {
-    const m = ["Nam", "Hưng", "Linh", "Quân", "Thảo", "Đạt", "Mai", "Tuấn"].map((n, i) => ({
-      id: uid(), name: n, phone: "", level: ["Trung bình", "Khá", "Tốt"][i % 3],
-      joined: today(), active: true,
+    const courtId = {};
+    const courts = SEED.courts.map(({ ref, ...c }) => {
+      const id = uid();
+      courtId[ref] = id;
+      return { ...c, id };
+    });
+    const members = [], txs = [];
+    for (const { ref, deposit, ...m } of SEED.members) {
+      const id = uid();
+      members.push({ ...m, id, joined: today() });
+      if (deposit) {
+        txs.push({ id: uid(), date: today(), type: "thu", amount: deposit,
+                   cat: "Nạp quỹ", note: m.name, memberId: id });
+      }
+    }
+    const slots = SEED.slots.map(({ court, ...s }) => ({
+      ...s, id: uid(), courtId: courtId[court],
     }));
-    const c = [
-      { id: uid(), name: "Sân Cầu Giấy – sân 3", place: "12 Trần Duy Hưng", price: 90000, note: "" },
-      { id: uid(), name: "Nhà thi đấu Mỹ Đình – sân 1", place: "Lê Đức Thọ", price: 120000, note: "" },
-    ];
-    up(() => ({
-      members: m, courts: c,
-      slots: [{ id: uid(), dow: 3, start: "19:00", end: "21:00", courtId: c[0].id },
-              { id: uid(), dow: 0, start: "08:00", end: "10:00", courtId: c[1].id }],
-      txs: m.map((x) => ({ id: uid(), date: today(), type: "thu", amount: 300000,
-              cat: "Nạp quỹ", note: x.name, memberId: x.id })),
-    }));
+    up(() => ({ members, courts, slots, txs }));
   };
 
   const wipe = () => {
@@ -444,21 +496,28 @@ export default function App() {
           <div className="rail-foot">
             <div className="bal">Tiền mặt trong quỹ</div>
             <div className="amt">{vnd(balance)}</div>
-            <div className="bal" style={{ marginTop: 4 }}>Số dư thành viên {vnd(held)}</div>
+            <div className="bal" style={{ marginTop: 4 }}>Quỹ chung {vnd(balance - deposits)}</div>
             <div className="roleline">
-              <span className={"pill " + (admin ? "adm" : "")}>{admin ? "Quản lý" : "Chỉ xem"}</span>
+              <span className={"pill " + (role === "admin" ? "adm" : role === "host" ? "open" : "")}>{ROLES[role]}</span>
             </div>
-            {admin ? (
+            {role !== "admin" && (
+              <button onClick={() => setGate({ mode: "open", val: "", err: "" })}>Nhập mã để mở quyền</button>
+            )}
+            {role === "admin" && (
               <>
-                <button onClick={() => data.pin ? setAdmin(false) : setGate({ mode: "set", val: "", err: "" })}>
-                  {data.pin ? "Khoá lại, chỉ xem" : "Đặt mã quản lý"}
+                <button onClick={() => setGate({ mode: "admin", val: "", err: "" })}>
+                  {pins.admin ? "Đổi mã thủ quỹ" : "Đặt mã thủ quỹ"}
                 </button>
-                {data.pin && <button style={{ marginLeft: 10 }} onClick={() => setGate({ mode: "set", val: "", err: "" })}>Đổi mã</button>}
+                <div>
+                  <button onClick={() => setGate({ mode: "host", val: "", err: "" })}>
+                    {pins.host ? "Đổi mã trực buổi" : "Đặt mã trực buổi"}
+                  </button>
+                </div>
+                {locked && <div><button onClick={() => setRole("view")}>Khoá lại, chỉ xem</button></div>}
                 <div><button onClick={wipe}>Xoá dữ liệu</button></div>
               </>
-            ) : (
-              <button onClick={() => setGate({ mode: "open", val: "", err: "" })}>Mở quyền quản lý</button>
             )}
+            {role === "host" && <div><button onClick={() => setRole("view")}>Khoá lại, chỉ xem</button></div>}
           </div>
         </nav>
 
@@ -473,19 +532,25 @@ export default function App() {
                   Không lưu được thay đổi vừa rồi. Thử lại sau một lát.
                 </p>
               )}
-              {!admin && (
+              {role === "view" && (
                 <div className="viewnote">
                   Chế độ chỉ xem: bạn xem được lịch, quỹ và số dư nhưng không sửa được gì.
-                  Bấm “Mở quyền quản lý” ở góc dưới nếu bạn giữ mã.
+                  Bấm “Nhập mã để mở quyền” ở góc dưới nếu bạn giữ mã.
                 </div>
               )}
-              <Adm.Provider value={admin}>
-                {tab === "home" && <Home {...{ data, balance, held, upcoming, unsettled, seed, setTab }} />}
+              {role === "host" && (
+                <div className="viewnote">
+                  Quyền trực buổi: bạn tạo được buổi đánh, tích tên có mặt và chốt tiền buổi.
+                  Quỹ, sổ thành viên và danh sách sân do thủ quỹ giữ.
+                </div>
+              )}
+              <Role.Provider value={role}>
+                {tab === "home" && <Home {...{ data, balance, deposits, debts, upcoming, unsettled, seed, setTab }} />}
                 {tab === "ses" && <Sessions {...{ data, up, sorted }} />}
                 {tab === "mem" && <Members {...{ data, up }} />}
                 {tab === "fund" && <Fund {...{ data, up, balance }} />}
                 {tab === "court" && <Courts {...{ data, up }} />}
-              </Adm.Provider>
+              </Role.Provider>
             </>
           )}
          </div>
@@ -493,29 +558,39 @@ export default function App() {
 
         {gate && (
           <Modal
-            title={gate.mode === "open" ? "Mở quyền quản lý" : "Mã quản lý"}
+            title={gate.mode === "open" ? "Nhập mã" : `Mã ${ROLES[gate.mode].toLowerCase()}`}
             sub={gate.mode === "open"
-              ? "Nhập mã của thủ quỹ để sửa được dữ liệu."
-              : "Đặt mã để lần sau app mở ở chế độ chỉ xem. Để trống rồi lưu là bỏ mã."}
+              ? "App tự nhận ra bạn là thủ quỹ hay người trực buổi theo mã bạn nhập."
+              : "Đặt mã để lần sau app mở ở chế độ chỉ xem. Để trống rồi lưu là bỏ mã này."}
             onClose={() => setGate(null)}
             saveLabel={gate.mode === "open" ? "Mở" : "Lưu mã"}
             onSave={() => {
               if (gate.mode === "open") {
-                if (gate.val === data.pin) { setAdmin(true); setGate(null); }
+                const val = gate.val.trim();
+                // thử mã thủ quỹ trước: ai đặt trùng hai mã thì được vai cao hơn
+                const got = val && pins.admin === val ? "admin"
+                          : val && pins.host === val ? "host" : null;
+                if (got) { setRole(got); setGate(null); }
                 else setGate({ ...gate, err: "Mã không đúng." });
               } else {
-                up(() => ({ pin: gate.val.trim() || null }));
+                up((d) => ({ pins: { ...(d.pins || {}), [gate.mode]: gate.val.trim() || null } }));
                 setGate(null);
               }
             }}>
-            <Field label={gate.mode === "open" ? "Mã quản lý" : "Mã mới"}>
+            <Field label={gate.mode === "open" ? "Mã của bạn" : "Mã mới"}>
               <input type="password" value={gate.val} autoFocus
                 onChange={(e) => setGate({ ...gate, val: e.target.value, err: "" })} />
             </Field>
             {gate.err && <p className="hint" style={{ color: "var(--clay)", margin: 0 }}>{gate.err}</p>}
+            {gate.mode === "host" && (
+              <p className="hint" style={{ margin: 0 }}>
+                Người có mã này tạo và sửa được buổi đánh, tích tên có mặt, chốt tiền buổi.
+                Quỹ, sổ thành viên và danh sách sân vẫn chỉ mình thủ quỹ sửa được.
+              </p>
+            )}
             <p className="hint" style={{ margin: 0 }}>
               Đây là khoá nhẹ để tránh sửa nhầm khi chuyền máy cho nhau, không phải bảo mật thật:
-              dữ liệu vẫn nằm trên máy này.
+              cả hai mã đều nằm trong localStorage của máy này, mở DevTools là đọc được.
             </p>
           </Modal>
         )}
@@ -526,8 +601,9 @@ export default function App() {
 
 /* ─────────────────────────  TỔNG QUAN  ───────────────────────── */
 
-function Home({ data, balance, held, upcoming, unsettled, seed, setTab }) {
+function Home({ data, balance, deposits, debts, upcoming, unsettled, seed, setTab }) {
   const admin = useAdmin();
+  const host = useHost();
   const { members, courts, sessions, txs } = data;
   const lowList = members.filter((m) => m.active && memBal(txs, m.id) < 100000);
   const bare = !members.length && !courts.length && !sessions.length;
@@ -544,7 +620,7 @@ function Home({ data, balance, held, upcoming, unsettled, seed, setTab }) {
         <div className="page-head"><div><h2>Tổng quan</h2><p>Chưa có gì trong sổ.</p></div></div>
         <div className="card empty">
           <b>Bắt đầu bằng việc thêm sân và thành viên</b>
-          Sau đó mỗi buổi đánh chỉ cần tích tên người có mặt, tiền sân và tiền cầu tự chia đầu người.
+          Sau đó mỗi buổi đánh chỉ cần tích tên người có mặt, tiền sân và tiền cầu tự chia theo phần.
           {admin && (
             <div className="row" style={{ justifyContent: "center", marginTop: 16 }}>
               <button className="btn pri" onClick={() => setTab("court")}>Thêm sân</button>
@@ -573,7 +649,7 @@ function Home({ data, balance, held, upcoming, unsettled, seed, setTab }) {
               <div className="strip">
                 <div><span>Đã tích tên</span><b>{nx.n} người</b></div>
                 <div><span>Tiền sân</span><b>{vnd(nx.courtCost)}</b></div>
-                <div><span>Dự kiến mỗi người</span><b>{nx.n ? vnd(nx.perHead) : "—"}</b></div>
+                <div><span>Dự kiến một phần</span><b>{nx.units ? vnd(nx.perHead) : "—"}</b></div>
               </div>
             </>
           ) : (
@@ -582,7 +658,7 @@ function Home({ data, balance, held, upcoming, unsettled, seed, setTab }) {
               <div className="title">Chưa có buổi nào sắp tới</div>
               <div className="meta">Tạo buổi đánh mới hoặc sinh buổi từ lịch cố định.</div>
               <div className="strip">
-                <button className="btn warm" onClick={() => setTab("ses")}>{admin ? "Mở lịch đánh" : "Xem lịch"}</button>
+                <button className="btn warm" onClick={() => setTab("ses")}>{host ? "Mở lịch đánh" : "Xem lịch"}</button>
               </div>
             </>
           )}
@@ -591,9 +667,11 @@ function Home({ data, balance, held, upcoming, unsettled, seed, setTab }) {
 
       <div className="cols c4" style={{ marginTop: 14 }}>
         <Stat label="Tiền mặt trong quỹ" value={vnd(balance)} tone={balance >= 0 ? "pos" : "neg"} />
-        <Stat label="Số dư của thành viên" value={vnd(held)} />
-        <Stat label="Quỹ chung của CLB" value={vnd(balance - held)} />
-        <Stat label="Chi tháng này" value={vnd(moChi)} tone="neg" />
+        <Stat label="Thành viên gửi trong quỹ" value={vnd(deposits)} />
+        <Stat label="Quỹ chung của CLB" value={vnd(balance - deposits)}
+          tone={balance - deposits < 0 ? "neg" : ""} />
+        <Stat label={debts ? "Thành viên đang nợ" : "Chi tháng này"}
+          value={debts ? vnd(debts) : vnd(moChi)} tone="neg" />
       </div>
 
       <div className="cols c3" style={{ marginTop: 14 }}>
@@ -673,7 +751,7 @@ function Home({ data, balance, held, upcoming, unsettled, seed, setTab }) {
 /* ─────────────────────────  BUỔI ĐÁNH  ───────────────────────── */
 
 function Sessions({ data, up, sorted }) {
-  const admin = useAdmin();
+  const can = useHost();
   const { members, courts, sessions, slots } = data;
   const [edit, setEdit] = useState(null);
   const [settle, setSettle] = useState(null);
@@ -686,8 +764,8 @@ function Sessions({ data, up, sorted }) {
 
   const blank = () => ({
     id: uid(), date: today(), start: "19:00", end: "21:00",
-    courtId: courts[0]?.id || "", attendees: [], shuttles: 4, shuttlePrice: 25000,
-    extra: 0, note: "", settled: false,
+    courtId: courts[0]?.id || "", attendees: [], shares: {}, guests: [],
+    shuttles: 4, shuttlePrice: 25000, extra: 0, note: "", settled: false,
   });
 
   const save = (s) => {
@@ -728,8 +806,8 @@ function Sessions({ data, up, sorted }) {
   return (
     <>
       <div className="page-head">
-        <div><h2>Buổi đánh</h2><p>Tích tên người có mặt, tiền sân và tiền cầu tự chia đầu người.</p></div>
-        {admin && (
+        <div><h2>Buổi đánh</h2><p>Tích tên người có mặt, tiền sân và tiền cầu chia theo phần.</p></div>
+        {can && (
           <div className="spread">
             <button className="btn mut" onClick={genFromSlots} disabled={!slots.length}>Sinh buổi từ lịch</button>
             <button className="btn pri" onClick={() => setEdit(blank())} disabled={!courts.length}>Buổi mới</button>
@@ -745,7 +823,7 @@ function Sessions({ data, up, sorted }) {
               <div key={sl.id} style={{ border: "1px solid var(--edge)", borderRadius: 8, padding: "9px 12px" }}>
                 <b style={{ fontSize: 14 }}>{DOW[sl.dow]}</b>
                 <div className="hint">{sl.start}–{sl.end} · {courts.find((c) => c.id === sl.courtId)?.name || "chưa có sân"}</div>
-                {admin && (
+                {can && (
                   <div className="acts" style={{ marginTop: 6, justifyContent: "flex-start" }}>
                     <button className="btn sm mut" onClick={() => setSlotForm(sl)}>Sửa</button>
                     <button className="btn sm dgr" onClick={() => up((d) => ({ slots: d.slots.filter((x) => x.id !== sl.id) }))}>Xoá</button>
@@ -755,7 +833,7 @@ function Sessions({ data, up, sorted }) {
             ))}
           </div>
         ) : <p className="hint">Chưa đặt ngày đánh cố định. Ví dụ: thứ tư 19:00–21:00 và chủ nhật 08:00–10:00.</p>}
-        {admin && (
+        {can && (
           <button className="btn sm" style={{ marginTop: 12 }} disabled={!courts.length}
             onClick={() => setSlotForm({ id: uid(), dow: 3, start: "19:00", end: "21:00", courtId: courts[0]?.id || "" })}>
             Thêm ngày cố định
@@ -783,7 +861,7 @@ function Sessions({ data, up, sorted }) {
                   <span className={"pill " + state[0]}>{state[1]}</span>
                   <div className="hint">{s.start}–{s.end} ({c.hrs} giờ) · {c.court?.name || "chưa có sân"}</div>
                 </div>
-                {admin && (
+                {can && (
                   <div className="acts" style={{ marginLeft: "auto" }}>
                     {s.settled
                       ? <button className="btn sm mut" onClick={() => unsettle(s)}>Bỏ chốt</button>
@@ -798,10 +876,10 @@ function Sessions({ data, up, sorted }) {
                 <Stat label="Có mặt" value={c.n + " người"} />
                 <Stat label="Tiền sân" value={vnd(c.courtCost)} />
                 <Stat label={`Cầu (${s.shuttles || 0} quả)`} value={vnd(c.shuttleCost)} />
-                <Stat label="Mỗi người" value={c.n ? vnd(c.perHead) : "—"} tone="pos" />
+                <Stat label="Một phần" value={c.units ? vnd(c.perHead) : "—"} tone="pos" />
               </div>
 
-              {!s.settled && admin && (
+              {!s.settled && can && (
                 <>
                   <p className="hint" style={{ margin: "14px 0 6px" }}>Bấm tên để tích có mặt · số trong ngoặc là số dư hiện có</p>
                   <div className="picks">
@@ -818,9 +896,12 @@ function Sessions({ data, up, sorted }) {
                   </div>
                 </>
               )}
-              {(s.settled || !admin) && !!c.n && (
+              {(s.settled || !can) && !!c.n && (
                 <p className="hint" style={{ marginBottom: 0 }}>
-                  {s.attendees.map((id) => members.find((m) => m.id === id)?.name || "?").join(", ")}
+                  {c.parts.map((p) => {
+                    const nm = p.memberId ? (members.find((m) => m.id === p.memberId)?.name || "?") : `${p.name} (khách)`;
+                    return p.share === 1 ? nm : `${nm} ×${p.share}`;
+                  }).join(", ")}
                 </p>
               )}
               {s.note && <p className="hint" style={{ marginBottom: 0 }}>Ghi chú: {s.note}</p>}
@@ -869,6 +950,20 @@ function SessionForm({ s: init, courts, members, onClose, onSave }) {
   const c = sessionCost(s, courts);
   const set = (k) => (e) => setS({ ...s, [k]: e.target.value });
   const setNum = (k) => (e) => setS({ ...s, [k]: +e.target.value || 0 });
+  const guests = s.guests || [];
+  const setShare = (id, v) => setS({ ...s, shares: { ...(s.shares || {}), [id]: v } });
+  const toggleOne = (id) => {
+    if (!s.attendees.includes(id)) return setS({ ...s, attendees: [...s.attendees, id] });
+    // bỏ tích thì quên luôn hệ số, lần sau tích lại bắt đầu từ một phần đầy đủ
+    const { [id]: _drop, ...rest } = s.shares || {};
+    setS({ ...s, attendees: s.attendees.filter((x) => x !== id), shares: rest });
+  };
+  const LBL = { fontSize: 12, fontWeight: 600, color: "var(--muted)" };
+  const pick = (value, onChange) => (
+    <select value={value} onChange={(e) => onChange(+e.target.value)}>
+      {SHARES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+    </select>
+  );
   return (
     <Modal title={init.settled ? "Sửa buổi đã chốt" : "Buổi đánh"}
       sub="Tiền sân tính theo giờ thuê; có thể ghi đè nếu chủ sân tính khác."
@@ -898,16 +993,61 @@ function SessionForm({ s: init, courts, members, onClose, onSave }) {
         <div className="picks">
           {members.length ? members.map((m) => (
             <button key={m.id} className={"pick " + (s.attendees.includes(m.id) ? "on" : "")}
-              onClick={() => setS({ ...s, attendees: s.attendees.includes(m.id)
-                ? s.attendees.filter((x) => x !== m.id) : [...s.attendees, m.id] })}>{m.name}</button>
+              onClick={() => toggleOne(m.id)}>{m.name}</button>
           )) : <span className="hint">Chưa có thành viên đang chơi.</span>}
         </div>
+      </div>
+
+      <div>
+        <label className="fld" style={{ marginBottom: 6 }}>
+          <span style={LBL}>Phần chia{c.units ? ` · ${c.units} phần, ${vnd(c.perHead)} một phần` : ""}</span>
+        </label>
+        {c.parts.length ? (
+          <table className="tbl">
+            <tbody>
+              {s.attendees.map((id) => (
+                <tr key={id}>
+                  <td className="nm">{members.find((m) => m.id === id)?.name || "?"}</td>
+                  <td style={{ width: 150 }}>{pick(shareOf(s, id), (v) => setShare(id, v))}</td>
+                  <td className="num" style={{ fontWeight: 600 }}>
+                    {vnd(c.parts.find((p) => p.memberId === id)?.amount || 0)}
+                  </td>
+                </tr>
+              ))}
+              {guests.map((g) => (
+                <tr key={g.id}>
+                  <td className="nm">
+                    <input value={g.name} placeholder="Tên khách"
+                      onChange={(e) => setS({ ...s, guests: guests.map((x) => x.id === g.id ? { ...x, name: e.target.value } : x) })} />
+                  </td>
+                  <td style={{ width: 150 }}>
+                    {pick(g.share ?? 1, (v) => setS({ ...s, guests: guests.map((x) => x.id === g.id ? { ...x, share: v } : x) }))}
+                  </td>
+                  <td className="num" style={{ fontWeight: 600 }}>
+                    {vnd(c.parts.find((p) => p.key === "g:" + g.id)?.amount || 0)}
+                    <button className="btn sm dgr" style={{ marginLeft: 8 }}
+                      onClick={() => setS({ ...s, guests: guests.filter((x) => x.id !== g.id) })}>Xoá</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : <p className="hint" style={{ margin: 0 }}>Tích tên người có mặt ở trên, hoặc thêm khách đánh ghép.</p>}
+        <button className="btn sm mut" style={{ marginTop: 8 }}
+          onClick={() => setS({ ...s, guests: [...guests, { id: uid(), name: "", share: 1 }] })}>
+          + Thêm khách đánh ghép
+        </button>
+        {c.guestCash > 0 && (
+          <p className="hint" style={{ marginBottom: 0 }}>
+            Khách trả {vnd(c.guestCash)} tiền mặt vào quỹ, nhờ đó phần của thành viên nhẹ đi.
+          </p>
+        )}
       </div>
       <div>
         <div className="split"><span>Tiền sân {c.hrs} giờ</span><b>{vnd(c.courtCost)}</b></div>
         <div className="split"><span>Tiền cầu {s.shuttles} quả</span><b>{vnd(c.shuttleCost)}</b></div>
         {!!c.extra && <div className="split"><span>Chi khác</span><b>{vnd(c.extra)}</b></div>}
-        <div className="split tot"><span>Mỗi người ({c.n} người, làm tròn lên 1.000₫)</span><b>{c.n ? vnd(c.perHead) : "—"}</b></div>
+        <div className="split tot"><span>Một phần đầy đủ ({c.units} phần, làm tròn lên 1.000₫)</span><b>{c.units ? vnd(c.perHead) : "—"}</b></div>
       </div>
     </Modal>
   );
@@ -919,24 +1059,33 @@ function SettleForm({ s, data, up, onClose }) {
   const [mode, setMode] = useState("balance");
   const surplus = c.collected - c.total;
 
-  const rows = s.attendees.map((id) => {
-    const m = members.find((x) => x.id === id);
-    const before = memBal(txs, id);
-    return { id, name: m?.name || "?", before, after: before - c.perHead };
+  /* Khách trả tiền mặt nên không có dòng số dư, chỉ thành viên mới bị trừ. */
+  const rows = c.parts.filter((p) => p.memberId).map((p) => {
+    const before = memBal(txs, p.memberId);
+    return { ...p, name: members.find((x) => x.id === p.memberId)?.name || "?",
+             before, after: before - p.amount };
   });
+  const guestRows = c.parts.filter((p) => !p.memberId);
   const short = rows.filter((r) => r.after < 0);
 
   const done = () => {
-    const add = [{ id: uid(), date: s.date, type: "chi", amount: c.total, cat: "Tiền sân",
-      note: `Buổi ${dmy(s.date)} ${s.start}–${s.end}`, sesId: s.id }];
+    /* Mỗi phần chi ghi đúng hạng mục của nó, đừng dồn hết vào "Tiền sân" —
+       không thì thống kê chi và giá sân mỗi giờ đều sai. */
+    const note = `Buổi ${dmy(s.date)} ${s.start}–${s.end}`;
+    const add = [["Tiền sân", c.courtCost], ["Tiền cầu", c.shuttleCost], ["Khác", c.extra]]
+      .filter(([, amount]) => amount > 0)
+      .map(([cat, amount]) => ({ id: uid(), date: s.date, type: "chi", amount, cat, note, sesId: s.id }));
     if (mode === "balance")
-      rows.forEach((r) => add.push({ id: uid(), date: s.date, type: "tru", amount: c.perHead,
-        cat: "Tiền buổi đánh", note: `Buổi ${dmy(s.date)}`, memberId: r.id, sesId: s.id }));
+      rows.forEach((r) => add.push({ id: uid(), date: s.date, type: "tru", amount: r.amount,
+        cat: "Tiền buổi đánh", note: `Buổi ${dmy(s.date)}`, memberId: r.memberId, sesId: s.id }));
     if (mode === "collect")
-      rows.forEach((r) => add.push({ id: uid(), date: s.date, type: "thu", amount: c.perHead,
-        cat: "Nạp quỹ", note: `Trả tiền buổi ${dmy(s.date)}`, memberId: r.id, sesId: s.id },
-        { id: uid(), date: s.date, type: "tru", amount: c.perHead,
-        cat: "Tiền buổi đánh", note: `Buổi ${dmy(s.date)}`, memberId: r.id, sesId: s.id }));
+      rows.forEach((r) => add.push({ id: uid(), date: s.date, type: "thu", amount: r.amount,
+        cat: "Nạp quỹ", note: `Trả tiền buổi ${dmy(s.date)}`, memberId: r.memberId, sesId: s.id },
+        { id: uid(), date: s.date, type: "tru", amount: r.amount,
+        cat: "Tiền buổi đánh", note: `Buổi ${dmy(s.date)}`, memberId: r.memberId, sesId: s.id }));
+    /* Khách trả tiền mặt ở mọi kiểu chốt, kể cả khi quỹ chung chịu phần thành viên. */
+    guestRows.forEach((g) => add.push({ id: uid(), date: s.date, type: "thu", amount: g.amount,
+      cat: "Khách đánh ghép", note: `${g.name} · buổi ${dmy(s.date)}`, sesId: s.id }));
     up((d) => ({ txs: [...d.txs, ...add],
       sessions: d.sessions.map((x) => (x.id === s.id ? { ...x, settled: true } : x)) }));
     onClose();
@@ -949,7 +1098,7 @@ function SettleForm({ s, data, up, onClose }) {
         <div className="split"><span>Tiền sân {c.hrs} giờ</span><b>{vnd(c.courtCost)}</b></div>
         <div className="split"><span>Tiền cầu {s.shuttles || 0} quả</span><b>{vnd(c.shuttleCost)}</b></div>
         {!!c.extra && <div className="split"><span>Chi khác</span><b>{vnd(c.extra)}</b></div>}
-        <div className="split tot"><span>Tổng chi · mỗi người {vnd(c.perHead)}</span><b>{vnd(c.total)}</b></div>
+        <div className="split tot"><span>Tổng chi · {c.units} phần, {vnd(c.perHead)} một phần</span><b>{vnd(c.total)}</b></div>
       </div>
 
       <Field label="Cách tính">
@@ -961,15 +1110,18 @@ function SettleForm({ s, data, up, onClose }) {
       </Field>
 
       {mode === "fund" ? (
-        <p className="hint">Quỹ chung của CLB chịu toàn bộ {vnd(c.total)}, số dư mọi người giữ nguyên.</p>
+        <p className="hint">Quỹ chung của CLB chịu phần của thành viên, số dư mọi người giữ nguyên.
+          {c.guestCash > 0 && ` Khách vẫn trả ${vnd(c.guestCash)} tiền mặt như thường.`}</p>
       ) : (
         <>
           <table className="tbl">
-            <thead><tr><th>Người có mặt</th><th className="num">Số dư trước</th><th className="num">Còn lại</th></tr></thead>
+            <thead><tr><th>Người có mặt</th><th className="num">Phải trả</th><th className="num">Số dư trước</th><th className="num">Còn lại</th></tr></thead>
             <tbody>
               {rows.map((r) => (
-                <tr key={r.id}>
-                  <td className="nm">{r.name}</td>
+                <tr key={r.key}>
+                  <td className="nm">{r.name}
+                    {r.share !== 1 && <span className="sub">phần ×{r.share}</span>}</td>
+                  <td className="num">{vnd(r.amount)}</td>
                   <td className="num">{vnd(r.before)}</td>
                   <td className="num" style={{ fontWeight: 600, color: r.after < 0 ? "var(--clay)" : "var(--court)" }}>
                     {vnd(r.after)}
@@ -979,17 +1131,33 @@ function SettleForm({ s, data, up, onClose }) {
             </tbody>
           </table>
           {mode === "collect" && (
-            <p className="hint">Mỗi người trả {vnd(c.perHead)} tại sân: tiền vào quỹ rồi trừ ra ngay, số dư không đổi.</p>
+            <p className="hint">Mọi người trả tại sân: tiền vào quỹ rồi trừ ra ngay, số dư không đổi.</p>
           )}
           {!!short.length && mode === "balance" && (
             <p className="hint" style={{ color: "var(--clay)" }}>
               {short.map((r) => r.name).join(", ")} sẽ bị âm số dư. Vẫn chốt được, nhắc họ nạp thêm sau.
             </p>
           )}
-          {surplus !== 0 && (
-            <p className="hint">Chênh {vnd(surplus)} do làm tròn lên 1.000₫ sẽ vào quỹ chung.</p>
-          )}
         </>
+      )}
+
+      {!!guestRows.length && (
+        <>
+          <p className="hint" style={{ margin: "12px 0 6px" }}>Khách đánh ghép trả tiền mặt, tiền vào thẳng quỹ:</p>
+          <table className="tbl">
+            <tbody>
+              {guestRows.map((g) => (
+                <tr key={g.key}>
+                  <td className="nm">{g.name}{g.share !== 1 && <span className="sub">phần ×{g.share}</span>}</td>
+                  <td className="num" style={{ fontWeight: 600 }}>{vnd(g.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+      {surplus !== 0 && (
+        <p className="hint">Chênh {vnd(surplus)} do làm tròn lên 1.000₫ mỗi phần sẽ vào quỹ chung.</p>
       )}
     </Modal>
   );
@@ -1071,7 +1239,10 @@ function MemberSheet({ m, data, onClose, onPay }) {
                     <td>{s.start}–{s.end}<span className="sub">{c.court?.name || "chưa có sân"}</span></td>
                     <td className="num">{c.n}</td>
                     <td className="num" style={{ fontWeight: 600 }}>
-                      {s.settled ? vnd(c.perHead) : <span className="pill open">chưa chốt</span>}
+                      {s.settled
+                        ? <>{vnd(c.parts.find((p) => p.memberId === m.id)?.amount || 0)}
+                            {shareOf(s, m.id) !== 1 && <span className="sub">phần ×{shareOf(s, m.id)}</span>}</>
+                        : <span className="pill open">chưa chốt</span>}
                     </td>
                   </tr>
                 ))}
@@ -1229,7 +1400,8 @@ function Fund({ data, up, balance }) {
   const sum = (type, only) => txs.filter((t) => t.type === type && (!only || t.date.startsWith(mo)))
     .reduce((a, t) => a + t.amount, 0);
   const list = [...txs].filter((t) => filter === "all" || t.type === filter).reverse();
-  const held = members.reduce((s, m) => s + memBal(txs, m.id), 0);
+  const deposits = depositsOf(txs, members);
+  const debts = debtsOf(txs, members);
   const LBL = { thu: ["thu", "Tiền vào quỹ"], chi: ["chi", "Tiền ra khỏi quỹ"], tru: ["open", "Trừ số dư"] };
 
   const blank = { id: uid(), date: today(), type: "chi", amount: 0, cat: "Tiền cầu", note: "", memberId: "" };
@@ -1249,14 +1421,17 @@ function Fund({ data, up, balance }) {
 
       <div className="cols c4">
         <Stat label="Tiền mặt trong quỹ" value={vnd(balance)} tone={balance >= 0 ? "pos" : "neg"} />
-        <Stat label="Số dư của thành viên" value={vnd(held)} />
-        <Stat label="Quỹ chung của CLB" value={vnd(balance - held)} />
+        <Stat label="Thành viên gửi trong quỹ" value={vnd(deposits)} />
+        <Stat label="Quỹ chung của CLB" value={vnd(balance - deposits)}
+          tone={balance - deposits < 0 ? "neg" : ""} />
         <Stat label="Chi tháng này" value={vnd(sum("chi", true))} tone="neg" />
       </div>
 
       <p className="hint" style={{ marginTop: 12 }}>
         Tiền mặt trong quỹ gồm phần mọi người nạp trước còn chưa dùng, cộng quỹ chung của CLB
-        (tài trợ, tiền lẻ làm tròn, phần quỹ tự chịu).
+        (tài trợ, tiền lẻ làm tròn, phần quỹ tự chịu). Quỹ chung là phần CLB tiêu được:
+        nó không tính tiền đang giữ hộ thành viên, cũng không tính khoản ai đó đang nợ.
+        {debts > 0 && ` Hiện có ${vnd(debts)} thành viên nợ quỹ, chưa thu về.`}
       </p>
 
       <div className="pane" style={{ marginTop: 14 }}>
@@ -1384,6 +1559,7 @@ function Fund({ data, up, balance }) {
 
 function Courts({ data, up }) {
   const admin = useAdmin();
+  const host = useHost();
   const { courts, sessions, slots, txs } = data;
   const [edit, setEdit] = useState(null);
   const blank = { id: uid(), name: "", place: "", price: 90000, note: "" };
@@ -1494,7 +1670,7 @@ function Courts({ data, up }) {
                 );
               })}
               <p className="hint" style={{ margin: "10px 0 0" }}>
-                {admin ? "Sửa lịch này ở tab Buổi đánh." : "Lịch cố định do thủ quỹ đặt."}
+                {host ? "Sửa lịch này ở tab Buổi đánh." : "Lịch cố định do thủ quỹ và người trực buổi đặt."}
               </p>
             </div>
 
